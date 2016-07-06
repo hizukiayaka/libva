@@ -39,13 +39,36 @@
 
 #define CONFIG(id)  ((object_config_p) object_heap_lookup( &driver_data->config_heap, id ))
 #define CONTEXT(id) ((object_context_p) object_heap_lookup( &driver_data->context_heap, id ))
-#define SURFACE(id)	((object_surface_p) object_heap_lookup( &driver_data->surface_heap, id ))
+#define SURFACE(id) ((object_surface_p) object_heap_lookup( &driver_data->surface_heap, id ))
 #define BUFFER(id)  ((object_buffer_p) object_heap_lookup( &driver_data->buffer_heap, id ))
+#define IMAGE(id)   ((object_image_p) object_heap_lookup( &driver_data->image_heap, id))
 
 #define CONFIG_ID_OFFSET		0x01000000
 #define CONTEXT_ID_OFFSET		0x02000000
 #define SURFACE_ID_OFFSET		0x04000000
 #define BUFFER_ID_OFFSET		0x08000000
+#define IMAGE_ID_OFFSET			0x10000000
+
+#define NEW_IMAGE_ID() object_heap_allocate(&driver_data->image_heap);
+
+enum {
+	DUMMY_SURFACETYPE_YUV,
+	DUMMY_SURFACETYPE_INDEXED,
+};
+
+/* List of supported image formats */
+typedef struct {
+		unsigned int        type;
+		VAImageFormat       va_format;
+} dummy_image_format_map_t;
+
+static const dummy_image_format_map_t
+dummy_image_formats_map[] = {
+	{ DUMMY_SURFACETYPE_YUV,
+	 { VA_FOURCC_YV12, VA_LSB_FIRST, 12, } },
+	{},
+
+};
 
 static void dummy__error_message(const char *msg, ...)
 {
@@ -428,7 +451,18 @@ VAStatus dummy_QueryImageFormats(
 	int *num_formats           /* out */
 )
 {
-    /* TODO */
+    int n = 0;
+
+	for (n = 0; dummy_image_formats_map[n].va_format.fourcc != 0; n++)
+	{
+	    const dummy_image_format_map_t * const m = &dummy_image_formats_map[n];
+		if (format_list)
+		    format_list[n] = m->va_format;
+	}
+
+	if (num_formats)
+	    *num_formats = n;
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -437,11 +471,70 @@ VAStatus dummy_CreateImage(
 	VAImageFormat *format,
 	int width,
 	int height,
-	VAImage *image     /* out */
+	VAImage *out_image     /* out */
 )
 {
-    /* TODO */
+    INIT_DRIVER_DATA
+	struct object_image *obj_image;
+	VAStatus va_status = VA_STATUS_ERROR_OPERATION_FAILED;
+	VAImageID image_id;
+	unsigned int size2, size;
+
+	out_image->image_id = VA_INVALID_ID;
+	out_image->buf      = VA_INVALID_ID;
+
+	image_id = NEW_IMAGE_ID();
+	if (image_id == VA_INVALID_ID)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+	obj_image = IMAGE(image_id);
+	if (!obj_image)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+	obj_image->palette    = NULL;
+
+	VAImage * const image = &obj_image->image;
+	image->image_id       = image_id;
+	image->buf            = VA_INVALID_ID;
+
+	size = width * height;
+	size2 = (width / 2) * (height / 2);
+
+	switch (format->fourcc) {
+	case VA_FOURCC_YV12:
+		image->num_planes = 3;
+		image->pitches[0] = width;
+		image->offsets[0] = 0;
+		image->pitches[1] = width / 2;
+		image->offsets[1] = size;
+		image->pitches[2] = width / 2;
+		image->offsets[2] = size + size2;
+		image->data_size  = size + 2 * size2;
+		break;
+	default:
+		goto error;
+
+	}
+
+	va_status = dummy_CreateBuffer(ctx, 0, VAImageBufferType,
+				image->data_size, 1, NULL, &image->buf);
+	if (va_status != VA_STATUS_SUCCESS)
+			goto error;
+
+	struct object_buffer *obj_buffer = BUFFER(image->buf);
+	if (!obj_buffer)
+		return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+	image->image_id             = image_id;
+	image->format               = *format;
+	image->width                = width;
+	image->height               = height;
+
+	*out_image                  = *image;
     return VA_STATUS_SUCCESS;
+
+error:
+	dummy_DestroyImage(ctx, image_id);
+	return va_status;
 }
 
 VAStatus dummy_DeriveImage(
@@ -459,7 +552,23 @@ VAStatus dummy_DestroyImage(
 	VAImageID image
 )
 {
-    /* TODO */
+    INIT_DRIVER_DATA
+	struct object_image *obj_image = IMAGE(image);
+
+	if (!obj_image)
+		return VA_STATUS_SUCCESS;
+	if (obj_image->image.buf != VA_INVALID_ID) {
+			dummy_DestroyBuffer(ctx, obj_image->image.buf);
+			obj_image->image.buf = VA_INVALID_ID;
+	}
+
+	if (obj_image->palette) {
+			free(obj_image->palette);
+			obj_image->palette = NULL;
+	}
+	
+	object_heap_free(&driver_data->image_heap, (struct object_base *)obj_image);
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -473,6 +582,33 @@ VAStatus dummy_SetImagePalette(
     return VA_STATUS_SUCCESS;
 }
 
+static VAStatus
+get_image_i420(struct object_image *obj_image, uint8_t *image_data,
+               struct object_surface *obj_surface,
+               const VARectangle *rect)
+{
+	uint8_t *dst[3];
+	/* Always YVU 4:2:0 */
+	const int Y = 0;
+	const int V = 1;
+	const int U = 2;
+	int x, y;
+	double rx, ry;
+
+	VAStatus va_status = VA_STATUS_SUCCESS;
+
+	/* Dest VA image has either I420 or YV12 format. */
+	dst[Y] = image_data + obj_image->image.offsets[Y];
+	dst[U] = image_data + obj_image->image.offsets[U];
+	dst[V] = image_data + obj_image->image.offsets[V];
+
+	memset(dst[Y], 255, rect->width * rect->height);
+	memset(dst[U], 128, (rect->width / 2) * (rect->height / 2));
+	memset(dst[V], 128, (rect->width / 2) * (rect->height / 2));
+
+	return va_status;
+}
+
 VAStatus dummy_GetImage(
 	VADriverContextP ctx,
 	VASurfaceID surface,
@@ -483,10 +619,35 @@ VAStatus dummy_GetImage(
 	VAImageID image
 )
 {
-    /* TODO */
+	INIT_DRIVER_DATA
+
+	VARectangle rect;
+	VAStatus va_status;
+	void *image_data = NULL;
+	
+	struct object_surface * const obj_surface = SURFACE(surface);
+	struct object_image * const obj_image = IMAGE(image);
+
+	if (!obj_surface)
+			return VA_STATUS_ERROR_INVALID_SURFACE;
+	if (!obj_image)
+			return VA_STATUS_ERROR_INVALID_IMAGE;
+
+	rect.x = x;
+	rect.y = y;
+	rect.width = width;
+	rect.height = height;
+
+	va_status = dummy_MapBuffer(ctx, obj_image->image.buf, &image_data);
+	va_status = get_image_i420(obj_image, image_data,
+           obj_surface, &rect);
+
+	va_status = dummy_UnmapBuffer(ctx, obj_image->image.buf);
+
+	return va_status;
+
     return VA_STATUS_SUCCESS;
 }
-
 
 VAStatus dummy_PutImage(
 	VADriverContextP ctx,
@@ -875,9 +1036,10 @@ VAStatus dummy_DestroyBuffer(
 {
     INIT_DRIVER_DATA
     object_buffer_p obj_buffer = BUFFER(buffer_id);
-    ASSERT(obj_buffer);
+    if(NULL == obj_buffer)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
 
-    dummy__destroy_buffer(driver_data, obj_buffer);
+	dummy__destroy_buffer(driver_data, obj_buffer);
     return VA_STATUS_SUCCESS;
 }
 
@@ -1224,6 +1386,9 @@ VAStatus VA_DRIVER_INIT_FUNC(  VADriverContextP ctx )
     ASSERT( result == 0 );
 
     result = object_heap_init( &driver_data->buffer_heap, sizeof(struct object_buffer), BUFFER_ID_OFFSET );
+    ASSERT( result == 0 );
+
+    result = object_heap_init( &driver_data->image_heap, sizeof(struct object_image), IMAGE_ID_OFFSET );
     ASSERT( result == 0 );
 
 

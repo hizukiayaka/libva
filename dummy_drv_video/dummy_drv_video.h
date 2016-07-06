@@ -41,6 +41,7 @@ struct dummy_driver_data {
     struct object_heap	context_heap;
     struct object_heap	surface_heap;
     struct object_heap	buffer_heap;
+    struct object_heap	image_heap;
 };
 
 struct object_config {
@@ -66,6 +67,9 @@ struct object_context {
 struct object_surface {
     struct object_base base;
     VASurfaceID surface_id;
+    int orig_width;
+    int orig_height;
+    int fourcc;
 };
 
 struct object_buffer {
@@ -75,9 +79,17 @@ struct object_buffer {
     int num_elements;
 };
 
+struct object_image {
+	struct object_base base;
+	VAImage image;
+	VASurfaceID derived_surface;
+	unsigned int *palette;
+};
+
 typedef struct object_config *object_config_p;
 typedef struct object_context *object_context_p;
 typedef struct object_surface *object_surface_p;
 typedef struct object_buffer *object_buffer_p;
+typedef struct object_image *object_image_p;
 
 #endif /* _DUMMY_DRV_VIDEO_H_ */
